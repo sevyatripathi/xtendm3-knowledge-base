@@ -1,0 +1,267 @@
+/**
+ *  Business Engine Extension
+ */
+/****************************************************************************************
+Extension Name: EXT551MI.AddRetPedimento
+Type: ExtendM3Transaction
+Script Author: Shweta Tripathi
+Date:  2026-03-24
+Description: Add Pedimento Number after OIS390 is executed.
+Revision History:
+Name               Dev ID       Date           Version         Description of Changes
+Shweta Tripathi    MC0551       2026-03-24     1.0             Initial Version
+******************************************************************************************/
+import java.time.LocalDate
+import java.time.LocalDateTime  
+import java.time.format.DateTimeFormatter
+import java.time.format.DateTimeParseException
+public class AddRetPedimento extends ExtendM3Transaction {
+  private final MIAPI mi
+  private final DatabaseAPI database
+  private final ProgramAPI program
+  private final LoggerAPI logger
+  private final MICallerAPI miCaller
+  
+  // Initialize String variables
+  private String inRORN = ""
+  private String inRIDN = ""
+  private String inWHLO = ""
+  private String inITNO = ""
+  private String ridi
+  private String trdt_mws
+  private String trtm_mws
+  private String icdn
+  private String TRDT_Str = ""
+  
+  // Initialize Numeric variables
+  private int inCONO = 0
+  private int inRORL = 0
+  private int inTRDT = 0
+  private int inTRTM = 0
+  
+  private String errorMsg   = ""
+  
+  private BigDecimal inTRQT = BigDecimal.ZERO
+  
+  public AddRetPedimento(MIAPI mi, DatabaseAPI database, ProgramAPI program, MICallerAPI miCaller, LoggerAPI logger) {
+    this.mi = mi
+    this.database = database
+    this.program = program
+    this.logger = logger
+    this.miCaller = miCaller
+  }
+  
+  public void main() {
+
+  logger.debug("=== AddRetPedimento START ===")
+
+  inCONO = (mi.in.get("CONO") == null)  ? (Integer) program.LDAZD.CONO : (Integer) mi.in.get("CONO")
+  inRORN = mi.in.get("RORN") == null ? "" : mi.in.get("RORN").toString()
+  inRORL = (mi.in.get("RORL") == null) ? 0 : (Integer) mi.in.get("RORL")
+  inRIDN = mi.in.get("RIDN") == null ? "" : mi.in.get("RIDN").toString()
+  inWHLO = mi.in.get("WHLO") == null ? "" : mi.in.get("WHLO").toString()
+  inITNO = mi.in.get("ITNO") == null ? "" : mi.in.get("ITNO").toString()
+  inTRTM = mi.in.get("TRTM") == null ? 0 : (Integer) mi.in.get("TRTM")
+  
+  if (mi.in.get("TRDT") != null) {
+    inTRDT = mi.in.get("TRDT")
+    TRDT_Str = inTRDT.toString()
+  }
+
+  if (mi.in.get("TRQT") != null) {
+    inTRQT = new BigDecimal(mi.in.get("TRQT").toString())
+  }
+
+  logger.debug("Input values -> CONO=${inCONO}, RORN=${inRORN}, RORL=${inRORL}, RIDN=${inRIDN}, WHLO=${inWHLO}, ITNO=${inITNO}, TRDT=${inTRDT}, TRTM=${inTRTM}, TRQT=${inTRQT}")
+  
+  Optional<DBContainer> CMNCMP = findCMNCMP(inCONO)  
+  if(!CMNCMP.isPresent()){                         
+     mi.error("Company " + inCONO + " is invalid")   
+     return                                          
+  }   
+
+  // --- Read OOEAD ---
+  DBAction query = database.table("OOHEAD").index("00").selection("OACONO", "OAORNO", "OADIVI").build()
+
+  DBContainer container = query.getContainer()
+  container.set("OACONO", inCONO)
+  container.set("OAORNO", inRORN)
+  
+  if (!query.read(container)) {
+    logger.debug("Order not found in OOHEAD")
+    mi.error("Order not found in OOHEAD")
+    return
+  }
+  
+  String divi = container.get("OADIVI")?.toString()
+  
+  logger.debug("OOHEAD DIVI: " + divi)
+  
+  if (divi == null || !divi.equals("186")) {
+    logger.debug("DIVI check failed → exiting")
+    return
+  }
+  
+  logger.debug("DIVI validated: " + divi)
+  if (inWHLO != null) {
+    Optional<DBContainer> MITWHL = findMITWHL(inCONO, inWHLO)  
+    if(!MITWHL.isPresent()){                         
+       mi.error("Warehouse " + inWHLO + " is invalid")   
+       return                                           
+    }   
+  }
+  
+  if (inITNO != null) {
+    Optional<DBContainer> MITMAS = findMITMAS(inCONO, inITNO)  
+    if(!MITMAS.isPresent()){                         
+       mi.error("Item Number " + inITNO + " is invalid")   
+       return                                           
+    }   
+  }
+  
+  if (TRDT_Str != "" && !isDateValid(TRDT_Str,"yyyyMMdd")){
+      mi.error("Date " + TRDT_Str + " (TRDT) is invalid")   
+      return                                           
+  }
+
+  // --- Call MWS070MI ---
+  Map<String, String> paramsTrans = new HashMap<>()
+  paramsTrans.put("CONO", String.valueOf(inCONO))
+  paramsTrans.put("RIDN", inRORN)
+  paramsTrans.put("RIDL", String.valueOf(inRORL))
+
+  logger.debug("Calling MWS070MI.ListTransByRef with params: " + paramsTrans)
+
+  final boolean[] first = [true]
+
+  miCaller.call("MWS070MI", "ListTransByRef", paramsTrans, { Map<String, String> respTrans ->
+
+    logger.debug("MWS070MI response: " + respTrans)
+
+    if (!first[0]) return
+    first[0] = false
+
+    ridi = respTrans.get("RIDI")
+    trdt_mws = respTrans.get("TRDT")
+    trtm_mws = respTrans.get("TRTM")
+
+    logger.debug("Extracted from MWS070MI -> RIDI=${ridi}, TRDT=${trdt_mws}, TRTM=${trtm_mws}")
+  })
+
+  // --- Call CMS135MI Get ---
+  Map<String, String> paramsCMS = new HashMap<>()
+  //paramsCMS.put("CONO", String.valueOf(inCONO))
+  paramsCMS.put("TTYP", "31")
+  paramsCMS.put("RIDN", inRORN)
+  paramsCMS.put("RIDL", String.valueOf(inRORL))
+  paramsCMS.put("RIDI", ridi)
+  paramsCMS.put("TRDT", trdt_mws)
+  paramsCMS.put("TRTM", trtm_mws)
+
+  logger.debug("Calling CMS135MI.Get with params: " + paramsCMS)
+
+  miCaller.call("CMS135MI", "Get", paramsCMS, { Map<String, String> respCMS ->
+
+    logger.debug("CMS135MI Get response: " + respCMS)
+
+    icdn = respCMS.get("ICDN")?.toString()
+
+    if (icdn == null || icdn.isEmpty()) {
+      logger.debug("ICDN is empty → skipping CMS135MI.Add")
+      mi.error("ICDN is empty → skipping CMS135MI.Add")
+      return
+    }
+
+    logger.debug("ICDN fetched: " + icdn)
+  })
+  int decimals = 2  // default
+
+  DBAction query1 = database.table("MITMAS").index("00").selection("MMDCCD").build()
+  DBContainer container1 = query1.getContainer()
+  container1.set("MMCONO", inCONO)
+  container1.set("MMITNO", inITNO)
+  if (query1.read(container1)) {
+      decimals = container1.get("MMDCCD")
+  }
+  // --- Call CMS135MI Add ---
+  Map<String, String> paramsAdd = new HashMap<>()
+  paramsAdd.put("CONO", String.valueOf(inCONO))
+  paramsAdd.put("TTYP", "90")
+  paramsAdd.put("RIDN", inRIDN)
+  paramsAdd.put("TRDT", String.valueOf(inTRDT))
+  paramsAdd.put("TRTM", String.valueOf(inTRTM))
+  paramsAdd.put("WHLO", inWHLO)
+  paramsAdd.put("ITNO", inITNO)
+  paramsAdd.put("ICDN", icdn)
+  String format = "%." + decimals + "f"
+  paramsAdd.put("TRQT", String.format(format, inTRQT))
+  
+  paramsAdd.put("STAS", "2")
+
+  logger.debug("Calling CMS135MI.Add with params: " + paramsAdd)
+
+  miCaller.call("CMS135MI", "Add", paramsAdd, { respAdd ->
+    Map<String, Object> resp = (Map<String, Object>) respAdd
+    boolean hasError = resp.get("error") != null && (boolean) resp.get("error")
+
+    if (hasError) {
+      String errorMessage = resp.get("errorMessage")?.toString()
+      mi.error("CMS135MI.Add failed: " + errorMessage)
+      return
+    }
+    logger.debug("CMS135MI Add response: " + respAdd)
+    logger.debug("SUCCESS: CMS135 record created with ICDN=" + icdn)
+
+    mi.write()
+  })
+ }
+  //********************************************************************************************************
+  //Validate company
+  //******************************************************************************************************** 
+  private Optional<DBContainer> findCMNCMP(Integer CONO){                             
+    DBAction query = database.table("CMNCMP").index("00").selection("JICONO").build()   
+    DBContainer CMNCMP = query.getContainer()                                           
+    CMNCMP.set("JICONO", CONO)   
+    if(query.read(CMNCMP))  {                                                           
+      return Optional.of(CMNCMP)                                                        
+    }                                                                                   
+    return Optional.empty()                                                             
+  } 
+  //********************************************************************************************************
+  //Validate Warehouse
+  //******************************************************************************************************** 
+  private Optional<DBContainer> findMITWHL(int CONO, String WHLO){                             
+    DBAction query = database.table("MITWHL").index("00").selection("MWCONO", "MWWHLO").build()   
+    DBContainer MITWHL = query.getContainer()                                           
+    MITWHL.set("MWCONO", CONO)   
+    MITWHL.set("MWWHLO", WHLO)  
+    if(query.read(MITWHL))  {                                                           
+      return Optional.of(MITWHL)                                                        
+    }                                                                                   
+    return Optional.empty()                                                             
+  } 
+  //********************************************************************************************************
+  //Validate Item Number
+  //******************************************************************************************************** 
+  private Optional<DBContainer> findMITMAS(int CONO, String ITNO){                             
+    DBAction query = database.table("MITMAS").index("00").selection("MMCONO", "MMITNO").build()   
+    DBContainer MITMAS = query.getContainer()                                           
+    MITMAS.set("MMCONO", CONO)   
+    MITMAS.set("MMITNO", ITNO)  
+    if(query.read(MITMAS))  {                                                           
+      return Optional.of(MITMAS)                                                        
+    }                                                                                   
+    return Optional.empty()                                                             
+  } 
+  //********************************************************************************************************
+  //Validate date
+  //********************************************************************************************************
+  public boolean isDateValid(String date, String format) {
+    try {
+      LocalDate.parse(date, DateTimeFormatter.ofPattern(format))
+      return true
+    } catch (DateTimeParseException e) {
+      return false
+    }
+  }   
+}

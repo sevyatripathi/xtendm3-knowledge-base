@@ -1,0 +1,173 @@
+public class OverrideAddress extends ExtendM3Transaction {
+  private final MIAPI mi;
+  private final DatabaseAPI database;
+  private final UtilityAPI utility;
+  private final ProgramAPI program;
+  private final MICallerAPI miCaller;
+  private final LoggerAPI logger;
+  
+  int inCONO;
+  String inORNO;
+  
+  public OverrideAddress(MIAPI mi, DatabaseAPI database, UtilityAPI utility, ProgramAPI program, MICallerAPI miCaller, LoggerAPI logger) {
+    this.mi = mi;
+    this.database = database;
+    this.utility = utility;
+    this.program = program;
+    this.miCaller = miCaller;
+    this.logger = logger;
+  }
+  
+  public void main() {
+    // Read inputs
+    inCONO = (mi.in.get("CONO") == null) ? (Integer) program.LDAZD.CONO : (Integer) mi.in.get("CONO");
+    inORNO = (mi.in.get("ORNO") == null || mi.in.get("ORNO").equals("null")) ? "" : (String) mi.in.get("ORNO");
+    
+    logger.debug("EXT100MI OverrideAddress Log: Input company ${inCONO} and Order ${inORNO}");
+    
+    if (!validateCONO(inCONO)) {
+      mi.error("Invalid company " + inCONO);
+      return;
+    }
+    
+    String cuor = getCUOR(inCONO, inORNO);
+    if (cuor == null || cuor.trim().isEmpty()) {
+      //mi.error("CUOR not found for ORNO " + inORNO);
+      return;
+    }
+    
+    String[] poLineData = getPOLineData(cuor);
+    String rorn = poLineData[0];
+    String rorl = poLineData[1];
+    if (rorn == null || rorn.trim().isEmpty()) {
+      //mi.error("RORN not found for PUNO " + cuor);
+      return;
+    }
+    
+    char ltyp = getLTYP(inCONO, rorn, (rorl != null ? Integer.parseInt(rorl.trim()) : 0));
+    if (ltyp != '2') {
+      return;
+    }
+    
+    String[] addressData = getSourceAddress(inCONO, rorn);
+    if (addressData == null) {
+      mi.error("Address not found for ORNO " + rorn);
+      return;
+    }
+    
+    updateTargetAddress(inCONO, inORNO, addressData[0], addressData[1]);
+    
+    updateOOHEAD(inCONO, inORNO, addressData[1]);
+  }
+  
+  /**
+   * Query OOHEAD to get CUOR (Customer Order Number)
+   */
+  private String getCUOR(int cono, String orno) {
+    DBAction query = database.table("OOHEAD").index("00").selection("OACUOR").build();
+    DBContainer container = query.getContainer();
+    container.set("OACONO", cono);
+    container.set("OAORNO", orno);
+    if (query.read(container)) {
+      return container.getString("OACUOR");
+    }
+    return null;
+  }
+  
+  /**
+   * Call PPS200MI.GetLine with PUNO to get RORN and RORL
+   */
+  private String[] getPOLineData(String puno) {
+    String[] result = new String[2];
+    Map<String, String> params = ["PUNO": puno, "PNLI": "1", "PNLS": "0"];
+    miCaller.call("PPS200MI", "GetLine", params, { Map<String, String> response ->
+      result[0] = response.get("RORN");
+      result[1] = response.get("RORL");
+    });
+    return result;
+  }
+  
+  /**
+   * Query OOLINE with RORN and RORL to get OBLTYP
+   */
+  private char getLTYP(int cono, String orno, int ponr) {
+    DBAction query = database.table("OOLINE").index("00").selection("OBLTYP").build();
+    DBContainer container = query.getContainer();
+    container.set("OBCONO", cono);
+    container.set("OBORNO", orno);
+    container.setInt("OBPONR", ponr);
+    container.setInt("OBPOSX", 0);
+    if (query.read(container)) {
+      return (char) container.get("OBLTYP");
+    }
+    return (char) 0;
+  }
+  
+  /**
+   * Query OOADRE with ORNO=RORN, ADRT=1 to get EDES and MODL
+   */
+  private String[] getSourceAddress(int cono, String orno) {
+    DBAction query = database.table("OOADRE").index("00").selection("ODEDES", "ODMODL").build();
+    DBContainer container = query.getContainer();
+    container.set("ODCONO", cono);
+    container.set("ODORNO", orno);
+    container.setInt("ODADRT", 1);
+    if (query.read(container)) {
+      return [container.getString("ODEDES"), container.getString("ODMODL")] as String[];
+    }
+    return null;
+  }
+  
+  /**
+   * Update OOADRE on input ORNO with EDES and MODL from source order
+   */
+  private void updateTargetAddress(int cono, String orno, String edes, String modl) {
+    DBAction query = database.table("OOADRE").index("00").selection("ODEDES", "ODMODL").build();
+    DBContainer container = query.getContainer();
+    container.set("ODCONO", cono);
+    container.set("ODORNO", orno);
+    container.setInt("ODADRT", 1);
+    Closure<?> updater = { LockedResult lockedResult ->
+      lockedResult.set("ODEDES", edes);
+      lockedResult.set("ODMODL", modl);
+      //lockedResult.set("OBLMDT", (int) utility.call("DateUtil", "currentDateY8AsInt"));
+      lockedResult.set("ODCHNO", lockedResult.getInt("ODCHNO") + 1);
+      lockedResult.set("ODCHID", program.getUser());
+      lockedResult.update();
+    };
+    query.readLock(container, updater);
+  }
+  
+  /**
+   * Update MODL on OOHEAD for the input ORNO
+   */
+  private void updateOOHEAD(int cono, String orno, String modl) {
+    DBAction query = database.table("OOHEAD").index("00").selection("OAMODL").build();
+    DBContainer container = query.getContainer();
+    container.set("OACONO", cono);
+    container.set("OAORNO", orno);
+    Closure<?> updater = { LockedResult lockedResult ->
+      lockedResult.set("OAMODL", modl);
+      lockedResult.set("OACHNO", lockedResult.getInt("OACHNO") + 1);
+      lockedResult.set("OACHID", program.getUser());
+      lockedResult.update();
+    };
+    query.readLock(container, updater);
+  }
+  
+  /**
+   * Validate if input company exists in table CMNCMP
+   * This method checks if the user input CONO exists in M3 table CMNCMP
+   * @param int cono
+   * @return true if CONO exists, false if not
+   */
+  private boolean validateCONO(int cono) {
+    DBAction query = database.table("CMNCMP").index("00").build();
+    DBContainer CMNCMP = query.getContainer();
+    CMNCMP.set("JICONO", inCONO);
+    if (!query.read(CMNCMP)) {
+      return false;
+    }
+    return true;
+  }
+}

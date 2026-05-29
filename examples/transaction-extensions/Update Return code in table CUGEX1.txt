@@ -1,0 +1,236 @@
+/**
+ *  Business Engine Extension
+ */
+/****************************************************************************************
+Extension Name: EXT533MI.SetReturnCode
+Type: ExtendM3Transaction
+Script Author: Shweta Tripathi
+Date:  2026-01-19
+Description: Update Return code in table CUGEX1
+Revision History:
+Name               Dev ID       Date           Version         Description of Changes
+Shweta Tripathi    MC0533       2026-01-19     1.0             Initial Version
+******************************************************************************************/
+import java.time.LocalDate
+import java.time.LocalDateTime  
+import java.time.format.DateTimeFormatter
+public class SetReturnCode extends ExtendM3Transaction {
+  private final MIAPI mi
+  private final DatabaseAPI database
+  private final ProgramAPI program
+  private final LoggerAPI logger
+  
+  // Initialize String variables
+  private String inITNO = ""
+  private String xxHIE1 = ""
+  private String xxHIE2 = ""
+  private String xxHIE3 = ""
+  private String xxHIE4 = ""
+  private String retCode = ""
+   
+  // Initialize Numeric variables
+  private int intCONO = 0
+  private int xxHAZI
+  
+  public SetReturnCode(MIAPI mi, DatabaseAPI database, ProgramAPI program, LoggerAPI logger) {
+    this.mi = mi
+    this.database = database
+    this.program = program
+    this.logger = logger
+  }
+  
+  public void main() {
+    intCONO = (mi.in.get("CONO") == null)  ? (Integer) program.LDAZD.CONO : (Integer) mi.in.get("CONO")
+    inITNO = mi.in.get("ITNO")
+   
+    if (!validateData()) {
+     logger.debug("Validation failed")
+     return
+    }
+    DBAction action = database.table("MITMAS").index("00").selection("MMCONO", "MMITNO", "MMHAZI", "MMHIE1", "MMHIE2", "MMHIE3", "MMHIE4").build()
+    DBContainer MITMAS = action.getContainer()
+
+    MITMAS.set("MMCONO", intCONO)
+    MITMAS.set("MMITNO", inITNO)
+
+    if (!action.read(MITMAS)) {
+      mi.error("Record does not exist")
+      return 
+    }
+    xxHAZI = MITMAS.getInt("MMHAZI")
+    xxHIE1 = MITMAS.getString("MMHIE1")
+    xxHIE2 = MITMAS.getString("MMHIE2")
+    xxHIE3 = MITMAS.getString("MMHIE3")
+    xxHIE4 = MITMAS.getString("MMHIE4")
+    logger.debug("xxHAZI value =" + xxHAZI)
+    if (xxHAZI == 1) {
+    // Update CUGEX1
+      retCode = "4"
+      updCUGEX1(retCode)
+    } else if (xxHAZI == 0) {
+      retCode = determineReturnCode8(MITMAS)
+      logger.debug("retCode value =" + retCode)
+      if (retCode == "8") {
+         updCUGEX1(retCode)
+      }
+    }
+  }
+  //********************************************************************************************************
+  //  Validate incoming data
+  // *******************************************************************************************************
+  boolean validateData() {
+   
+    logger.debug("Validation started")               
+    Optional<DBContainer> CMNCMP = findCMNCMP(intCONO)  
+    if(!CMNCMP.isPresent()){                         
+       mi.error("Company " + intCONO + " is invalid")   
+       return false                                            
+    }     
+      
+    if (inITNO == null) {
+      mi.error("Item Number must be entered")
+      return false 
+    }
+    
+    if (inITNO != null) {
+      Optional<DBContainer> MITMAS = findMITMAS(inITNO)  
+      if(!MITMAS.isPresent()){                         
+         mi.error("Item Number " + inITNO + " is invalid")   
+         return false                                           
+      }   
+    }
+    return true
+  }
+  //********************************************************************************************************
+  //Validate company
+  //******************************************************************************************************** 
+  private Optional<DBContainer> findCMNCMP(Integer CONO){                             
+    DBAction query = database.table("CMNCMP").index("00").selection("JICONO").build()   
+    DBContainer CMNCMP = query.getContainer()                                           
+    CMNCMP.set("JICONO", CONO)   
+    if(query.read(CMNCMP))  {                                                           
+      return Optional.of(CMNCMP)                                                        
+    }                                                                                   
+    return Optional.empty()                                                             
+  } 
+  //********************************************************************************************************
+  //Validate Item Number
+  //******************************************************************************************************** 
+  private Optional<DBContainer> findMITMAS(String ITNO){                             
+    DBAction query = database.table("MITMAS").index("00").selection("MMCONO", "MMITNO").build()   
+    DBContainer MITMAS = query.getContainer()                                           
+    MITMAS.set("MMCONO", intCONO)   
+    MITMAS.set("MMITNO", ITNO)  
+    if(query.read(MITMAS))  {                                                           
+      return Optional.of(MITMAS)                                                        
+    }                                                                                   
+    return Optional.empty()                                                             
+  } 
+  //********************************************************************************************************
+  //Determine return code
+  //******************************************************************************************************** 
+  String determineReturnCode8(DBContainer MITMAS) {
+    xxHIE1 = MITMAS.getString("MMHIE1")?.trim()
+    xxHIE2 = MITMAS.getString("MMHIE2")?.trim()
+    xxHIE3 = MITMAS.getString("MMHIE3")?.trim()
+    xxHIE4 = MITMAS.getString("MMHIE4")?.trim()
+    
+    logger.debug("xxHIE1 value =" + xxHIE1)
+    logger.debug("xxHIE2 value =" + xxHIE2)
+    logger.debug("xxHIE3 value =" + xxHIE3)
+    logger.debug("xxHIE4 value =" + xxHIE4)
+  
+    if (checkHIEInValueMap("1", xxHIE1)) return "8"
+    if (checkHIEInValueMap("2", xxHIE2)) return "8"
+    if (checkHIEInValueMap("3", xxHIE3)) return "8"
+    if (checkHIEInValueMap("4", xxHIE4)) return "8"
+  
+    return ""
+  }
+  //********************************************************************************************************
+  //Check CUGEVM for given MMHIE field
+  //******************************************************************************************************** 
+  boolean checkHIEInValueMap(String idx, String value) {
+    if (!value?.trim()) return false
+    boolean found = false
+  
+    ExpressionFactory expression = database.getExpressionFactory("CUGEVM")
+  
+    expression = expression
+        .eq("F3CONO", String.valueOf(intCONO))
+        .and(expression.eq("F3FILE", "MITMAS"))
+        .and(expression.eq("F3CUER", ""))
+        .and(expression.eq("F3FLDI", "F1A121"))
+        .and(expression.eq("F3AL30", idx.trim()))
+        .and(expression.eq("F3TX15", value.trim()))
+  
+    DBAction action = database.table("CUGEVM").matching(expression).selection("F3CONO").build()
+  
+    DBContainer c = action.getContainer()
+    c.set("F3CONO", intCONO)  
+    action.readAll(c, 1, { DBContainer data ->
+      found = true
+    })
+    logger.debug("CUGEVM found= " + found)
+    return found
+  }
+  //*********************************************************************************************************
+  // Update CUGEX1
+  //********************************************************************************************************
+  void updCUGEX1(String rtcd) {
+    logger.debug("return code =" + rtcd)
+    DBAction action = database.table("CUGEX1").index("00").build()
+    DBContainer CUGEX1 = action.createContainer()
+
+    CUGEX1.set("F1CONO", intCONO)
+    CUGEX1.set("F1FILE", "MITMAS")
+    CUGEX1.set("F1PK01", inITNO)
+    CUGEX1.set("F1PK02", "")
+    CUGEX1.set("F1PK03", "")
+    CUGEX1.set("F1PK04", "")
+    CUGEX1.set("F1PK05", "")
+    CUGEX1.set("F1PK06", "")
+    CUGEX1.set("F1PK07", "")
+    CUGEX1.set("F1PK08", "")
+    
+    if (action.readLock(CUGEX1, updateCallback(rtcd))) {
+      logger.debug("CUGEX1 record found")
+      return
+    }
+    CUGEX1.set("F1A930", rtcd)
+    CUGEX1.set("F1CHID", program.getUser())
+    CUGEX1.set("F1CHNO", 1)
+    LocalDateTime now = LocalDateTime.now()    
+    DateTimeFormatter format1 = DateTimeFormatter.ofPattern("yyyyMMdd")  
+    String formatDate = now.format(format1)   
+    DateTimeFormatter format2 = DateTimeFormatter.ofPattern("HHmmss") 
+    String formatTime = now.format(format2)        
+      
+    //Converting String into int using Integer.parseInt()
+    int regdate=Integer.parseInt(formatDate)
+    int regtime=Integer.parseInt(formatTime)
+    CUGEX1.set("F1RGDT", regdate) 
+    CUGEX1.set("F1LMDT", regdate) 
+    CUGEX1.set("F1RGTM", regtime) 
+    action.insert(CUGEX1)  
+    logger.debug("CUGEX1 record inserted")
+  }
+  Closure<?> updateCallback(String rtcd) {
+
+    return { LockedResult lockedResult ->
+  
+      lockedResult.set("F1A930", rtcd)
+  
+      int changeNo = lockedResult.get("F1CHNO")
+      lockedResult.set("F1CHNO", changeNo + 1)
+      lockedResult.set("F1CHID", program.getUser())
+  
+      LocalDateTime now = LocalDateTime.now()
+      int changedDate = Integer.parseInt(now.format(DateTimeFormatter.ofPattern("yyyyMMdd")))
+  
+      lockedResult.set("F1LMDT", changedDate)
+  
+      lockedResult.update()
+    }
+  }
+}

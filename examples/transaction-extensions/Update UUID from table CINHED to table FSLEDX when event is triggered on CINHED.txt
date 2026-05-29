@@ -1,0 +1,226 @@
+/**
+ *  Business Engine Extension
+ */
+/****************************************************************************************
+Extension Name: EXT542MI.UpdAddnInfo
+Type: ExtendM3Transaction
+Script Author: Shweta Tripathi
+Date:  2026-02-16
+Description: Update UUID from table CINHED to table FSLEDX when event is triggered on CINHED
+Revision History:
+Name               Dev ID       Date           Version         Description of Changes
+Shweta Tripathi    MC0533       2026-02-16     1.0             Initial Version
+******************************************************************************************/
+public class UpdAddnInfo extends ExtendM3Transaction {
+  private final MIAPI mi
+  private final DatabaseAPI database
+  private final ProgramAPI program
+  private final LoggerAPI logger
+  private final MICallerAPI miCaller
+  
+  // Initialize String variables
+  private String inCINO = ""
+  private String inDIVI = ""
+  private String xxGCID = ""
+  private String xxPYNO = ""
+   
+  // Initialize Numeric variables
+  private int intCONO = 0
+  private int intINYR = 0
+  private int xxIVDT = 0
+
+  public UpdAddnInfo(MIAPI mi, DatabaseAPI database, ProgramAPI program, MICallerAPI miCaller, LoggerAPI logger) {
+    this.mi = mi
+    this.database = database
+    this.program = program
+    this.logger = logger
+    this.miCaller = miCaller
+  }
+  
+  public void main() {
+     intCONO = (mi.in.get("CONO") == null)  ? (Integer) program.LDAZD.CONO : (Integer) mi.in.get("CONO")
+     inDIVI = (mi.in.get("DIVI") == null || mi.in.get("DIVI").equals("null")) ? "" : (String) mi.in.get("DIVI")
+     inCINO = (mi.in.get("CINO") == null || mi.in.get("CINO").equals("null")) ? "" : (String) mi.in.get("CINO")
+     intINYR = (mi.in.get("INYR") == null) ? 0 : (Integer) mi.in.get("INYR")
+     
+     if (!validateData()) {
+        logger.debug("Validation failed")
+        return
+     }
+     DBAction query = database.table("CINHED").index("00").selection("CICONO", "CIDIVI", "CIINYR", "CICINO", "CICGID", "CIIVDT", "CIPYNO").build()   
+     DBContainer CINHED = query.getContainer()                                           
+     CINHED.set("CICONO", intCONO)   
+     CINHED.set("CIDIVI", inDIVI)  
+     CINHED.set("CIINYR", intINYR)  
+     CINHED.set("CICINO", inCINO)  
+     if(!query.read(CINHED))  { 
+        mi.error("Invoice Number " + inCINO + " is invalid")   
+        return                                            
+     }   
+    
+     xxGCID = CINHED.getString("CICGID")    
+     xxIVDT = CINHED.getInt("CIIVDT") 
+     xxPYNO = CINHED.getString("CIPYNO") 
+     String xxCUNO = getCustomerNumber()
+     if (xxCUNO == null) return 
+     
+     Map<String, Integer> journalData = getJournalNumbers(xxCUNO, xxIVDT)
+     if (journalData == null) return
+    
+     int jrno = journalData.get("JRNO")
+     int jsno = journalData.get("JSNO")
+     logger.debug("JRNO: " + jrno + " JSNO: " + jsno)
+     
+     boolean updated = updateAdditionalInfo(jrno, jsno, xxGCID)
+     if (!updated) {
+       mi.error("Update failed")   
+       return
+     }
+  }
+  //********************************************************************************************************
+  //  Validate incoming data
+  // *******************************************************************************************************
+  boolean validateData() {
+   
+    logger.debug("Validation started")               
+    Optional<DBContainer> CMNCMP = findCMNCMP(intCONO)  
+    if(!CMNCMP.isPresent()){                         
+       mi.error("Company " + intCONO + " is invalid")   
+       return false                                            
+    }     
+    return true
+  }
+  //********************************************************************************************************
+  //Validate company
+  //******************************************************************************************************** 
+  private Optional<DBContainer> findCMNCMP(Integer CONO){                             
+    DBAction query = database.table("CMNCMP").index("00").selection("JICONO").build()   
+    DBContainer CMNCMP = query.getContainer()                                           
+    CMNCMP.set("JICONO", CONO)   
+    if(query.read(CMNCMP))  {                                                           
+      return Optional.of(CMNCMP)                                                        
+    }                                                                                   
+    return Optional.empty()                                                             
+  } 
+  //********************************************************************************************************
+  //Validate Invoice Number
+  //******************************************************************************************************** 
+  private Optional<DBContainer> findCINHED(Integer INYR, String CINO){                             
+    DBAction query = database.table("CINHED").index("00").selection("CICONO", "CIDIVI", "CIINYR", "CICINO").build()   
+    DBContainer CINHED = query.getContainer()                                           
+    CINHED.set("CICONO", intCONO)   
+    CINHED.set("CIDIVI", inDIVI)  
+    CINHED.set("CIINYR", INYR)  
+    CINHED.set("CICINO", CINO)  
+    if(query.read(CINHED))  {                                                           
+      return Optional.of(CINHED)                                                        
+    }                                                                                   
+    return Optional.empty()                                                             
+  } 
+  //********************************************************************************************************
+  // Fetch Customer Number (CUNO) using ARS200MI/SearchInvoices (SQRY input)
+  //******************************************************************************************************** 
+  private String getCustomerNumber() {
+     String customer = null
+     DBAction query = database.table("FSLEDG")
+        .index("10")
+        .selection("ESCUNO")
+        .build()
+  
+     DBContainer fsledg = query.getContainer()
+  
+     fsledg.set("ESCONO", intCONO)
+     fsledg.set("ESDIVI", inDIVI)
+     fsledg.set("ESPYNO", xxPYNO)
+     fsledg.set("ESCINO", inCINO)
+     fsledg.set("ESINYR", intINYR)
+  
+     query.readAll(fsledg, 5, 1, { DBContainer data ->   
+        customer = data.get("ESCUNO").toString().trim()
+     })
+  
+     if (customer == null) {
+        mi.error("Customer not found in FSLEDG for invoice " + inCINO)
+     }
+  
+     return customer
+  }
+  //********************************************************************************************************
+  // Fetch JRNO and JSNO using ARS200MI/GetUniqueKey
+  //********************************************************************************************************
+  private Map<String, Integer> getJournalNumbers(String cuno, int ivdt) {
+
+     Integer jrno = 0
+     Integer jsno = 0
+  
+     Map<String, String> params = new HashMap<String, String>()
+     params.put("CONO", String.valueOf(intCONO))
+     params.put("DIVI", inDIVI)
+     params.put("CUNO", cuno)
+     params.put("CINO", inCINO)
+     params.put("IVDT", String.valueOf(ivdt))   // use method input
+     params.put("INYR", String.valueOf(intINYR))
+     params.put("TRCD", "10")   // fixed value
+  
+     miCaller.call("ARS200MI", "GetUniqueKey", params, { Map<String, String> response ->
+  
+        if (response == null) {
+           return
+        }
+  
+        if (response.get("JRNO") != null) {
+           jrno = response.get("JRNO").toInteger()
+        }
+  
+        if (response.get("JSNO") != null) {
+           jsno = response.get("JSNO").toInteger()
+        }
+     })
+  
+     if (jrno == 0 || jsno == 0) {
+        mi.error("Failed to retrieve Journal Number / Sequence Number")
+        return null
+     }
+  
+     Map<String, Integer> result = new HashMap<String, Integer>()
+     result.put("JRNO", jrno)
+     result.put("JSNO", jsno)
+  
+     return result
+  }
+  //********************************************************************************************************
+  //Update Additional Information in FSLEDX using ARS251MI/AddInfoCat
+  // SEXN = 265
+  // SEXI = UUID (CICGID from CINHED)
+  //********************************************************************************************************
+  private boolean updateAdditionalInfo(int jrno, int jsno, String uuid) {
+     boolean success = false
+  
+     Map<String, String> params = new HashMap<String, String>()
+     params.put("DIVI", inDIVI)
+     params.put("YEA4", String.valueOf(intINYR))   // invoice year
+     params.put("JRNO", String.valueOf(jrno))
+     params.put("JSNO", String.valueOf(jsno))
+     params.put("SEXN", "265")                     // info category
+     params.put("SEXI", uuid)                      // UUID value
+  
+     miCaller.call("ARS251MI", "AddInfoCat", params, { Map<String, String> response ->
+  
+        if (response == null) {
+           return
+        }
+  
+        // If MI executed without error → assume success
+        success = true
+     })
+  
+     if (!success) {
+        mi.error("Failed to update Additional Information (FSLEDX)")
+        return false
+     }
+  
+     return true
+  }
+
+
+}

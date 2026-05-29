@@ -1,0 +1,112 @@
+/**
+ *  Business Engine Extension
+ */
+/****************************************************************************************
+ 
+Extension Name : EXT534MI.GetCOType  
+Type           : ExtendM3Transaction  
+Script Author  : Shweta Tripathi  
+Date           : 2026-01-13  
+Description    : Call ION API to retrieve CO type for the given PO type defined in ION decision matrix 
+
+Revision History:
+Name              Date         Version   Description of Changes
+Shweta Tripathi   2026-01-13   1.0       Initial Version
+
+******************************************************************************************/
+import groovy.json.JsonSlurper
+import java.util.Map
+
+public class GetCOType extends ExtendM3Transaction {
+  private final MIAPI mi
+  private final DatabaseAPI database
+  private final LoggerAPI logger
+  private final IonAPI ion
+   
+  // Initialize String variables
+  private String inPOTY = ""
+  
+  public GetCOType(MIAPI mi, DatabaseAPI database, IonAPI ion, LoggerAPI logger) {
+    this.mi = mi
+    this.database = database
+    this.logger = logger
+    this.ion = ion
+  }
+  
+  public void main() {
+    inPOTY = mi.in.get("POTY") 
+    
+     // Validate incoming data
+    if (!validateData()) {
+      logger.debug("Validation failed")
+      return
+    }
+    
+    // ---------------------------
+    // Decision Matrix payload
+    // ---------------------------
+    String payload = """
+    {
+      "parameters": {
+        "EXPOTY": "${inPOTY}"
+      }
+    }
+    """ 
+   /* String endpoint = "/ionbusinessrules/ping"
+
+    IonResponse response = ion.get(endpoint, [:], [:])
+    
+    logger.debug("Ping status = " + response.getStatusCode())
+    logger.debug("Ping content = " + response.getContent()) */
+   
+    String endpoint = "/IONSERVICES/businessrules/decision/execute/MC0534_PO_CO_Types"
+    // Headers
+  
+    Map<String, String> headers = [
+      "Content-Type": "application/json",
+      "Accept": "application/json"
+    ]
+    Map<String, String> queryParameters = [:]
+    
+    // POST call to Decision Matrix
+    IonResponse response = ion.post(endpoint, headers, queryParameters, payload)
+    
+    if (response.getStatusCode() != 200) {
+      mi.error("ION Decision API failed. HTTP " + response.getStatusCode()
+               + " - " + response.getErrorMessage())
+      logger.debug("Calling endpoint = " + endpoint)
+      return 
+    }
+    
+    // Read response content
+    String content = response.getContent()
+    if (!content) {
+       mi.error("Empty response from ION Decision Matrix")
+       return 
+    }
+    logger.debug("Decision API response: " + content)
+    
+    // Parse response
+    def json = new JsonSlurper().parseText(content)
+    def params = json["parameters"]
+    String coType = params != null ? params["EXCOTY"] : null
+
+    if (!coType) {
+        mi.error("No CO Type found for PO Type " + inPOTY)
+        return 
+    }
+      // Output
+    mi.outData.put("COTY", coType)
+  }
+  
+  //********************************************************************************************************
+  //  Validate incoming data
+  // *******************************************************************************************************
+  boolean validateData() {
+    if (inPOTY == null) {
+      mi.error("Purchase Order type must be entered")
+      return false
+    }
+    return true
+  }
+}

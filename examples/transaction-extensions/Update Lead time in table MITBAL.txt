@@ -1,0 +1,487 @@
+/**
+ *  Business Engine Extension
+ */
+/****************************************************************************************
+Extension Name: EXT524MI.SupplyingUpdLT
+Type: ExtendM3Transaction
+Script Author: Shweta Tripathi
+Date:  2026-02-09
+Description: Update Lead time in table MITBAL for all the receiving warehouses which belong to 
+supplying warehouse received as input parameter
+Revision History:
+Name               Dev ID       Date           Version         Description of Changes
+Shweta Tripathi    MC0524       2026-02-09     1.0             Initial Version
+******************************************************************************************/
+import java.time.LocalDate
+import java.time.LocalDateTime  
+import java.time.format.DateTimeFormatter
+public class SupplyingUpdLT extends ExtendM3Transaction {
+  private final MIAPI mi
+  private final ProgramAPI program
+  private final DatabaseAPI database
+  private final MICallerAPI miCaller
+  private final LoggerAPI logger
+  
+  private String inWHLO
+  private String inITNO
+  
+  private String xxWHLO
+  private String xxDIVI
+  private String xxITNO
+  private String xxSUWH
+  private String xxREWH
+  private String xxIPLA
+  private String xxGRP2
+  private String x1SUWH
+  private String supSUNO
+  private String supDIVI
+  private int xxLEAT
+  List<String> visitedWH = []
+  List<String> errorList = []
+  
+  private int intCONO
+  private int xxPUIT
+  
+   //MI API Calls
+  private String oAPIError = ""
+  private String oAPIErrorMsid = ""
+  private String oAPIErrorMessage = ""
+  
+  public SupplyingUpdLT(MIAPI mi, ProgramAPI program, DatabaseAPI database, MICallerAPI miCaller, LoggerAPI logger) {
+    this.mi = mi
+    this.program = program
+    this.database = database
+    this.miCaller = miCaller
+    this.logger = logger
+  }
+  
+  public void main() {
+    intCONO = mi.inData.get("CONO") as Integer
+    inWHLO = mi.inData.get("WHLO").trim()
+    inITNO = mi.inData.get("ITNO").trim()
+    
+    xxGRP2 = getDistClass(inITNO)
+    
+    // read supplier once
+    readSupplier(inWHLO)
+    
+    processWarehouse(inWHLO)
+    
+    if(!errorList.isEmpty()){
+       //mi.error("Lead time update errors: " + errorList.join(" | "))
+       logger.debug("Lead time update errors: " + errorList.join(" | "))
+    }
+  }
+  //------------------------------------------------------------------------
+  //Find Supplying warehouse SUNO and DIVI
+  //------------------------------------------------------------------------
+  void readSupplier(String whlo) {
+    DBAction whAction = database.table("MITWHL").index("00").selection("MWSUNO","MWDIVI").build()
+  
+    DBContainer MITWHL = whAction.getContainer()
+  
+    MITWHL.set("MWCONO", intCONO)
+    MITWHL.set("MWWHLO", whlo)
+  
+    if (!whAction.read(MITWHL)) {
+       mi.error("Warehouse not found " + whlo)
+       return
+    }
+  
+    supSUNO = MITWHL.getString("MWSUNO").trim()
+    supDIVI = MITWHL.getString("MWDIVI").trim()
+  
+    logger.debug("Root supplier = " + supSUNO)
+  }
+  // -----------------------------------------------------------------------
+  // Read all receiving warehouses for supplying warehouse SUWH
+  // -----------------------------------------------------------------------
+  void processWarehouse(String supplyingWH) {
+    if(supplyingWH == null || supplyingWH.trim().isEmpty()){
+       return
+    }
+    if (visitedWH.contains(supplyingWH)) {
+       return
+    }
+    visitedWH.add(supplyingWH)
+    logger.debug("PROCESS START for warehouse = " + supplyingWH)
+    // ---------------------------------------------------
+    
+    ExpressionFactory expression = database.getExpressionFactory("MITBAL")
+    expression = expression
+         .eq("MBCONO", String.valueOf(intCONO))
+         .and(expression.eq("MBSUWH", supplyingWH))
+         .and(expression.eq("MBITNO", inITNO))
+  
+    DBAction action = database.table("MITBAL")
+        .matching(expression)
+        .selection("MBPUIT","MBWHLO","MBITNO","MBSUWH","MBIPLA")
+        .build()
+  
+    DBContainer MITBAL = action.getContainer()
+  
+    action.readAll(MITBAL, 0, { DBContainer r ->
+  
+      String recWHLO = r.getString("MBWHLO").trim()
+      String recITNO = r.getString("MBITNO").trim()
+      int recPUIT = r.getInt("MBPUIT")
+      String recSUWH = r.getString("MBSUWH").trim()
+      String recIPLA = r.getString("MBIPLA").trim()
+    
+      logger.debug("Processing WHLO = " + recWHLO)
+    
+      xxWHLO = recWHLO
+      xxITNO = recITNO
+      xxPUIT = recPUIT
+      xxSUWH = recSUWH
+      xxIPLA = recIPLA
+    
+      if (recPUIT == 3) {
+          updateLEA1(recWHLO, recITNO)
+      }
+    
+      if (recPUIT == 2) {
+          int sutype = getSupplierType(supSUNO)
+          if (sutype == 7) {
+              x1SUWH = getWarehouseFromSupplier(recWHLO, recITNO, supSUNO)
+              updateLEA1(recWHLO, recITNO)
+          } else {
+              logger.debug("Skipping PUIT=2 non-ISO supplier " + supSUNO)
+          }
+      }
+      // -----------------------------
+      // RECURSION: check next level
+      // -----------------------------
+      processWarehouse(xxWHLO)
+    })
+  }
+  //*********************************************************************
+  // Set MBSUWH from supplier (ISO items MBPUIT=2)
+  // Join: MITBAL.MBSUNO = CIDVEN.IISUNO -> CIDVEN.IISUWH
+  //*********************************************************************
+  String getWarehouseFromSupplier(String whlo, String itno, String suno) {
+    if (suno == null || suno.isEmpty()) {
+       logger.debug("No supplier maintained for ITNO=" + itno)
+       return
+    }
+  
+    // -------------------- Read CIDVEN --------------------
+    DBAction actionVEN = database.table("CIDVEN")
+        .index("00")
+        .selection("IISUNO", "IISUWH")
+        .build()
+  
+    DBContainer CIDVEN = actionVEN.getContainer()
+    CIDVEN.set("IICONO", intCONO)
+    CIDVEN.set("IISUNO", suno)
+  
+    if (!actionVEN.read(CIDVEN)) {
+       logger.debug("CIDVEN not found for SUNO=" + suno)
+       return
+    }
+    return CIDVEN.getString("IISUWH").trim()
+  }
+
+  
+  //********************************************************************************************************
+  // Get Supplier type
+  //********************************************************************************************************
+  int getSupplierType(String suno) {
+
+    if (suno == null || suno.trim().isEmpty()) {
+      return -1
+    }
+  
+    DBAction action = database.table("CIDMAS")
+        .index("00")
+        .selection("IDSUTY")
+        .build()
+  
+    DBContainer CIDMAS = action.getContainer()
+  
+    CIDMAS.set("IDCONO", intCONO)
+    CIDMAS.set("IDSUNO", suno)
+  
+    if (action.read(CIDMAS)) {
+      return CIDMAS.getInt("IDSUTY")
+    }
+  
+    return -1
+  }
+  //********************************************************************************************************
+  // Update LEA1
+  //********************************************************************************************************
+  void updateLEA1(String whlo, String itno) {
+    readSupplier(xxSUWH)
+    
+    DBAction supAction = database.table("MITBAL")
+    .index("00")
+    .selection("MBIPLA","MBMSCH","MBLEAT","MBPFTM")
+    .build()
+
+    DBContainer SUP = supAction.getContainer()
+    
+    SUP.set("MBCONO", intCONO)
+    SUP.set("MBWHLO", xxSUWH)     // supplying warehouse
+    SUP.set("MBITNO", itno)
+    
+    if (!supAction.read(SUP)) {
+       logger.debug("No supplying MITBAL for " + xxSUWH + "/" + itno)
+       return
+    }
+   
+    String type = ''
+    String type1 = ''
+    int newLEAT = 0
+  
+    String ipla = SUP.getString("MBIPLA").trim()
+    int msch = SUP.getInt("MBMSCH")
+    int leat = SUP.getInt("MBLEAT")
+    int pftm = SUP.getInt("MBPFTM")
+    
+    if ( (ipla.trim().equals("") || ipla.trim().equals("10")) &&
+         ( msch == 0)) {
+        type = 'Excl_Whs_Rel'    
+       
+        if (!validateException(intCONO, type)) {
+           type1 = 'NotStocked'
+           xxLEAT = getTranslation(type1)
+           logger.debug("xxLEAT = " + xxLEAT)
+           newLEAT = xxLEAT +  SUP.getInt("MBLEAT")
+           logger.debug("newLEAT = " + newLEAT)
+           if (xxPUIT == 3) {
+              updateDisMITBAL(whlo, xxITNO, newLEAT)
+           } else if (xxPUIT == 2) {
+              updateIntMITBAL(whlo, xxITNO, newLEAT)
+           }
+        } else {
+          logger.debug("Exception found for whlo: " + type)
+          return
+        }
+    } else if ( (ipla.trim().equals("") || ipla.trim().equals("10")) &&
+         ( msch == 1)) {
+        type = 'Excl_Whs_Rel'    
+     
+        if (!validateException(intCONO, type)) {
+            type = 'PlanTimeFence'    
+            type1 = 'NotStocked'
+            xxLEAT = getTranslation(type1)
+            if (!validateException(intCONO, type)) {
+               logger.debug("Exception not found for whlo: " + type)
+               if (SUP.getInt("MBLEAT") >= SUP.getInt("MBPFTM")) {
+                  newLEAT = xxLEAT + SUP.getInt("MBLEAT")
+                  if (xxPUIT == 3) {
+                    updateDisMITBAL(whlo, xxITNO, newLEAT)
+                  } else if (xxPUIT == 2) {
+                    updateIntMITBAL(whlo, xxITNO, newLEAT)
+                  }
+               } else {
+                  newLEAT = xxLEAT +  SUP.getInt("MBPFTM")
+                  if (xxPUIT == 3) {
+                    updateDisMITBAL(whlo, xxITNO, newLEAT)
+                  } else if (xxPUIT == 2) {
+                    updateIntMITBAL(whlo, xxITNO, newLEAT)
+                  }
+               } 
+            } else {
+                 logger.debug("Exception found for whlo: " + type)
+                 newLEAT = xxLEAT + SUP.getInt("MBLEAT")
+                 if (xxPUIT == 3) {
+                    updateDisMITBAL(whlo, xxITNO, newLEAT)
+                 } else if (xxPUIT == 2) {
+                    updateIntMITBAL(whlo, xxITNO, newLEAT)
+                 }
+            }
+        } else {
+            logger.debug("Exception found for whlo: " + type)
+            return
+        }
+    } else if (ipla.trim().equals("20") || ipla.trim().equals("30")) {
+        type = 'Excl_Whs_Rel'    
+        if (!validateException(intCONO, type)) {
+            type = 'LeadTimeExc'   
+            type1 = 'Stocked'
+            xxLEAT = getTranslation(type1) 
+            // ====================================================
+            // LeadTimeExc override
+            // ====================================================
+            if (validateException(intCONO, "LeadTimeExc")) {
+              logger.debug("xxIPLA= " + xxIPLA)
+              logger.debug("xxGRP2= " + xxGRP2)
+              if ((xxIPLA.equals("") || xxIPLA.equals("10"))
+                  && !xxGRP2.equals("") ) {
+                  logger.debug("LeadTimeExc override active for " + xxSUWH + "_" + whlo)
+                  newLEAT = xxLEAT + SUP.getInt("MBLEAT")
+                  if (xxPUIT == 3) {
+                    updateDisMITBAL(whlo, xxITNO, newLEAT)
+                  } else if (xxPUIT == 2) {
+                    updateIntMITBAL(whlo, xxITNO, newLEAT)
+                  }
+                  return
+              } else if (xxIPLA.equals("20") || xxIPLA.equals("30")) {
+                newLEAT = xxLEAT  
+                if (xxPUIT == 3) {
+                  updateDisMITBAL(whlo, xxITNO, newLEAT)
+                } else if (xxPUIT == 2) {
+                  updateIntMITBAL(whlo, xxITNO, newLEAT)
+                }
+              } 
+            } else {
+              newLEAT = xxLEAT  
+              if (xxPUIT == 3) {
+                updateDisMITBAL(whlo, xxITNO, newLEAT)
+              } else if (xxPUIT == 2) {
+                updateIntMITBAL(whlo, xxITNO, newLEAT)
+              }
+            }
+        }  else {
+            logger.debug("Exception found for whlo: " + type)
+            return
+        }
+    }
+  }
+  //********************************************************************************************************
+  // Get distribution class for item
+  //********************************************************************************************************
+  String getDistClass(String itno) {
+
+    DBAction action = database.table("MITMAS")
+        .index("00")
+        .selection("MMGRP2")
+        .build()
+  
+    DBContainer MITMAS = action.getContainer()
+  
+    MITMAS.set("MMCONO", intCONO)
+    MITMAS.set("MMITNO", itno)
+  
+    if (action.read(MITMAS)) {
+      return MITMAS.getString("MMGRP2").trim()
+    }
+  
+    return ""
+  }
+  //********************************************************************************************************
+  // Call EXT524/GetException API to find exception
+  //********************************************************************************************************
+  boolean validateException(int cono, String type) {
+
+    boolean found = false
+  
+    DBAction action = database.table("EXTEXC")
+      .index("00") // index with EXCONO + EXTYPE, adjust if needed
+      .selection("EXSUWH","EXREWH")
+      .build()
+  
+    DBContainer c = action.getContainer()
+    c.set("EXCONO", cono)
+    c.set("EXTYPE", type)
+    c.set("EXSUWH", xxSUWH)
+    if (type == "PlanTimeFence") {
+      c.set("EXREWH", "")
+    } else {
+      c.set("EXREWH", xxWHLO)
+    }
+  
+    if (action.read(c)) {
+      logger.debug("Exception found for " + type + " " + xxSUWH + "_" + xxWHLO)
+      found = true
+      return true
+    }
+  
+    return found
+  }
+  //********************************************************************************************************
+  // Call EXT524/GetTranslation API to fetch Lead time EXLEAT
+  //********************************************************************************************************
+   int getTranslation(String type1) {
+  
+    DBAction action = database.table("EXTTRA")
+      .index("00")
+      .selection("EXLEAT")
+      .build()
+  
+    DBContainer c = action.getContainer()
+    c.set("EXCONO", intCONO)
+    c.set("EXDIVI", supDIVI)
+    c.set("EXTYPE", type1)
+  
+    if (action.read(c)) {
+      return c.getInt("EXLEAT")
+    }
+  
+    // fallback blank DIVI
+    c.set("EXDIVI", "")
+    if (action.read(c)) {
+      return c.getInt("EXLEAT")
+    }
+  
+    return 0
+  }
+  //********************************************************************************************************
+  // Update MITBAL for Distribution items
+  //********************************************************************************************************
+  void updateDisMITBAL(String whlo, String itno, int leat) {
+    oAPIError = ""
+    oAPIErrorMsid = ""
+    oAPIErrorMessage = ""
+    
+    Map<String, String> params = new HashMap<String, String>()
+    params.put("CONO", intCONO.toString())
+    params.put("WHLO", whlo)
+    params.put("ITNO", itno)
+    params.put("SUNO", supSUNO)
+    params.put("LEA1", String.valueOf(leat))
+  
+    Closure<?> callback = { Map<String, String> response ->
+  
+      if(response.containsKey("error")) {
+        oAPIError = response.get("error")
+        oAPIErrorMsid = response.get("errorMsid")
+        oAPIErrorMessage = response.get("errorMessage") 
+        
+        logger.debug("Error updating LEA1 via MMS200MI for " + whlo + "/" + itno + " : " + response.error)
+      } else {
+        logger.debug("LEA1 updated successfully via MMS200MI for " + whlo + "/" + itno + " = " + leat)
+      }
+      if (oAPIError.length() > 0) {
+         String err = "WHLO ${whlo} : ${oAPIErrorMessage}"
+         logger.debug("API ERROR : " + err)
+         errorList.add(err)
+      }
+    }
+    miCaller.call("MMS200MI", "UpdItmWhs", params, callback)
+  }
+   //********************************************************************************************************
+  // Update MITBAL for Internal Sales items
+  //********************************************************************************************************
+  void updateIntMITBAL(String whlo, String itno, int leat) {
+     oAPIError = ""
+     oAPIErrorMsid = ""
+     oAPIErrorMessage = ""
+    
+     Map<String, String> params = new HashMap<String, String>()
+      params.put("CONO", intCONO.toString())
+      params.put("WHLO", whlo)
+      params.put("ITNO", itno)
+      params.put("LEA1", String.valueOf(leat))
+    
+      Closure<?> callback = { Map<String, String> response ->
+    
+        if(response.containsKey("error")) {
+           oAPIError = response.get("error")
+           oAPIErrorMsid = response.get("errorMsid")
+           oAPIErrorMessage = response.get("errorMessage") 
+           logger.debug("Error updating LEA1 via MMS200MI for " + whlo + "/" + itno + " : " + response.error)
+        } else {
+          logger.debug("LEA1 updated successfully via MMS200MI for " + whlo + "/" + itno + " = " + leat)
+        }
+        if (oAPIError.length() > 0) {
+           String err = "WHLO ${whlo} : ${oAPIErrorMessage}"
+           logger.debug("API ERROR : " + err)
+           errorList.add(err)
+        }
+      }
+      miCaller.call("MMS200MI", "UpdItmWhs", params, callback)
+  }
+}
