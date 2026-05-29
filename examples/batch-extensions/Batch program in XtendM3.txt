@@ -1,0 +1,727 @@
+
+API program to trigger batch program:
+
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
+public class StartBatchJob extends ExtendM3Transaction {
+  private final MIAPI mi
+  private final ProgramAPI program
+  private final DatabaseAPI database
+  private final MICallerAPI miCaller
+  private final LoggerAPI logger
+  
+  public StartBatchJob(MIAPI mi, ProgramAPI program, DatabaseAPI database, MICallerAPI miCaller, LoggerAPI logger) {
+    this.mi = mi
+    this.program = program
+    this.database = database
+    this.miCaller = miCaller
+    this.logger = logger
+  }
+  
+  public void main() {
+    String jbna = mi.inData.get("JBNA")
+    
+    if (jbna == null || jbna.trim().isEmpty()) {
+      mi.error("Batch Job (JBNA) is mandatory")
+      return
+    }
+    
+    int cono = program.LDAZD.get("CONO")
+    String user = program.getUser()
+    
+    String uuid = UUID.randomUUID().toString()
+    
+    if (lockExists(cono, jbna, uuid)) {
+      updateEXTPARStatus(cono, uuid, jbna, "90", "Batch already running")
+      mi.error("Batch already running for this user/job")
+      return
+    }
+    
+    // Insert into EXTPAR
+    if (!insertEXTPAR(uuid, jbna)) {
+      return
+    }
+    
+    def params = [
+      "TX30": "Calling from EXT000MI",
+      "XCAT": "ALL",          
+      "SCTY": "1",           
+      "XNOW": "1",         
+      "JOB": jbna,
+      "UUID": uuid
+    ]
+    Closure<?> callback = { Map<String, String> result ->
+      logger.info("Batch submission result: ${result}")
+    }
+
+    miCaller.call("SHS010MI", "SchedXM3Job", params, callback)
+    
+    updateEXTPARStatus(cono, uuid, jbna, "20", "Batch submitted successfully")
+
+    mi.outData.put("STAT", "Batch Submitted")
+  }
+  //********************************************************************************************************
+  // Check if lock exists
+  // *******************************************************************************************************
+  private boolean lockExists(int cono, String job, String uuid) {
+
+    DBAction action = database.table("EXTLCK").index("00").build()
+  
+    DBContainer c = action.getContainer()
+    c.set("EXCONO", cono)
+    c.set("EXPGNM", job)
+    c.set("EXUUID", uuid)
+  
+    return action.read(c)
+  }
+  //********************************************************************************************************
+  // Insert Parameters in parameter table
+  // *******************************************************************************************************
+  private boolean insertEXTPAR(String uuid, String jobName) {
+
+    DBAction query = database.table("EXTPAR").index("00").build()
+    DBContainer container = query.getContainer()
+
+    int cono = mi.in.get("PAR0").toString().trim() as int
+    String user = program.getUser()
+
+    LocalDateTime now = LocalDateTime.now()
+    int regDate = now.format(DateTimeFormatter.ofPattern("yyyyMMdd")) as int
+    int regTime = now.format(DateTimeFormatter.ofPattern("HHmmss")) as int
+
+    // 🔹 Set keys
+    container.set("EXCONO", cono)
+    container.set("EXBJNO", uuid)
+    container.set("EXBJLI", "00")
+    container.set("EXBJNA", jobName)
+
+    // 🔹 Quick access params
+    container.set("EXPAR1", mi.in.get("PAR1") ?: "")
+    container.set("EXPAR2", mi.in.get("PAR2") ?: "")
+    container.set("EXPAR3", mi.in.get("PAR3") ?: "")
+    container.set("EXPAR4", mi.in.get("PAR4") ?: "")
+    container.set("EXPAR5", mi.in.get("PAR5") ?: "")
+    container.set("EXPAR6", mi.in.get("PAR6") ?: "")
+    container.set("EXPAR7", mi.in.get("PAR7") ?: "")
+    container.set("EXPAR8", mi.in.get("PAR8") ?: "")
+    container.set("EXPAR9", mi.in.get("PAR9") ?: "")
+    container.set("EXPAR0", mi.in.get("PAR0") ?: "")
+    container.set("EXSTAT", "10")   // Created
+    container.set("EXERMS", "")
+
+      // 🔹 Audit
+    container.set("EXRGDT", regDate)
+    container.set("EXRGTM", regTime)
+    container.set("EXLMDT", regDate)
+    container.set("EXCHNO", 0)
+    container.set("EXCHID", user)
+
+    if (!query.insert(container)) {
+      mi.error("Failed to create EXTPAR record")
+      return false
+    }
+
+    return true
+  }
+  //********************************************************************************************************
+  // Update status in EXTPAR
+  // *******************************************************************************************************
+  private void updateEXTPARStatus(int cono, String uuid, String jobName, String status, String message) {
+    DBAction action = database.table("EXTPAR").index("00").build()
+    DBContainer container = action.getContainer()
+  
+    container.set("EXCONO", cono)
+    container.set("EXBJNO", uuid)
+    container.set("EXBJLI", "00")
+    container.set("EXBJNA", jobName)
+  
+    action.readLock(container, { LockedResult lr ->
+      String msg = message
+      if (msg != null && msg.length() > 200) {
+        msg = msg.substring(0, 200)
+      }
+  
+      lr.set("EXSTAT", status)
+      lr.set("EXERMS", msg)
+      LocalDateTime now = LocalDateTime.now()
+      int lmdt = now.format(DateTimeFormatter.ofPattern("yyyyMMdd")) as int
+  
+      int chno = lr.get("EXCHNO")
+      lr.set("EXCHNO", chno + 1)
+      lr.set("EXLMDT", lmdt)
+      lr.set("EXCHID", program.getUser())
+  
+      lr.update()
+    })
+  }
+}
+
+
+Batch program
+
+/**
+ * Business Engine Extension
+ */
+/***********************************************************************************************************************
+ Extension Name : EXT537 
+ Type           : XtendM3Batch
+ Script Author  : Shweta Tripathi
+ Date           : 20260415
+
+ Description:
+ Perform Batch Job for automatic update of Schedule Number. This batch job updates tables MWOHED, MWOOPE, MWOMAT. Check 
+ Lock through table EXTLCK and delete lock once the process is done.
+
+ Revision History:
+ Name               Dev ID     Date        Version     Description of Changes
+ Shweta Tripathi    MC0537     20260415        1.0         Initial Version
+ ***********************************************************************************************************************/
+import java.time.LocalDate
+import java.time.LocalDateTime  
+import java.time.format.DateTimeFormatter
+public class EXT537 extends ExtendM3Batch {
+  private final DatabaseAPI database
+  private final LoggerAPI logger
+  private final ProgramAPI program
+  private final BatchAPI batch
+  
+  private String uuid
+  private String divi
+  private String faci
+  private String whlo
+  private String prno
+  private String mfno
+  private String resp
+  private String lockProgram = "EXT537"
+  
+  private int cono
+  private long schn
+  
+  public EXT537(DatabaseAPI database, BatchAPI batch, LoggerAPI logger, ProgramAPI program) {
+    this.database = database
+    this.batch = batch
+    this.logger = logger
+    this.program = program
+  }
+  
+  public void main() {
+    Optional<String> refId = batch.getReferenceId()
+
+    if (!refId.isPresent()) {
+      exitBatch("Reference ID (UUID) is missing")
+      return
+    }
+    
+    uuid = refId.get()
+    
+    if (!readEXTPAR()) {
+      exitBatch("Failed to read EXTPAR for UUID: " + uuid)
+      return
+    }
+    
+    if (!insertLock()) {
+      return
+    }
+    if (!validateData()) {
+      return
+    } 
+    
+    String scnb = getSupplyChainNo(cono, whlo, prno, mfno)
+    
+    if (scnb == null || scnb.isEmpty()) {
+      exitBatch("No supply chain number found in MPREAL")
+      return
+    }
+    
+    logger.debug("Supply chain number = " + scnb)
+   
+    List<Map<String, String>> moList = getAllMOs(scnb)   
+    
+     // 🔹 Loop
+    for (Map<String, String> rec : moList) {
+
+      int rCono = Integer.parseInt(rec.get("NACONO"))
+      String rPrno = rec.get("NAITNO")
+      String rMfno = rec.get("NAARDN")
+
+      logger.debug("Processing MO " + rMfno)
+
+      updateMWOHED(rCono, faci, rPrno, rMfno, schn)
+      updateMWOOPE(rCono, faci, rPrno, rMfno, schn)
+      updateMWOMAT(rCono, faci, rPrno, rMfno, schn)
+    }
+    updateEXTPARStatus("20", "Batch completed successfully")
+    deleteLock()
+    logger.debug("EXT537 completed")
+  }
+  //********************************************************************************************************
+  //Insert lock for the submitted job 
+  //********************************************************************************************************
+  private boolean insertLock() {
+
+    DBAction action = database.table("EXTLCK").index("00").build()
+    DBContainer lock = action.getContainer()
+
+    lock.set("EXCONO", cono)
+    lock.set("EXPGNM", lockProgram)
+    lock.set("EXUUID", uuid)
+    lock.set("EXVAL1", "")
+    lock.set("EXVAL2", "")
+  
+    lock.set("EXRGDT", LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd")) as int)
+    lock.set("EXRGTM", LocalDateTime.now().format(DateTimeFormatter.ofPattern("HHmmss")) as int)
+    lock.set("EXLMDT", lock.get("EXRGDT"))
+    lock.set("EXCHNO", 1)
+    lock.set("EXCHID", program.getUser())
+  
+    if (!action.insert(lock)) {
+      logger.error("Lock exists. Batch already running for UUID: " + uuid)
+      return false
+    }
+    return true
+  }
+  //********************************************************************************************************
+  // Delete lock on EXTLCK table
+  //********************************************************************************************************
+  private void deleteLock() {
+    DBAction action = database.table("EXTLCK").index("00").build()
+    DBContainer lock = action.getContainer()
+  
+    lock.set("EXCONO", cono)
+    lock.set("EXPGNM", lockProgram)
+    lock.set("EXUUID", uuid)
+  
+    action.readLock(lock, { LockedResult lr ->
+      lr.delete()
+    })
+  }
+  //********************************************************************************************************
+  // Read EXTPAR table to retrieve parameters
+  //********************************************************************************************************
+  private boolean readEXTPAR() {
+
+    DBAction query = database.table("EXTPAR")
+      .index("00")
+      .selection("EXBJNO", "EXBJLI", "EXPAR0", "EXPAR1","EXPAR2","EXPAR3","EXPAR4","EXPAR5","EXPAR6", "EXPAR7", "EXPAR8", "EXPAR9")
+      .build()
+  
+    DBContainer container = query.createContainer()
+    container.set("EXBJNO", uuid)
+    container.set("EXBJLI", "00")
+    container.set("EXBJNA", "EXT537")
+  
+    if (!query.read(container)) {
+      logger.error("No EXTPAR record found")
+      return false
+    }
+    
+    cono = container.get("EXPAR0").toString().trim() as int
+    divi = container.get("EXPAR1")?.toString()?.trim()   
+    faci = container.get("EXPAR2")?.toString()?.trim()
+    whlo = container.get("EXPAR3")?.toString()?.trim()
+    prno = container.get("EXPAR4")?.toString()?.trim()
+    mfno = container.get("EXPAR5")?.toString()?.trim()
+    String schnStr = container.get("EXPAR6")
+    if (schnStr == null || schnStr.trim().isEmpty()) {
+      logger.error("SCHN is missing")
+      return false
+    }
+    schn = Long.parseLong(schnStr.trim())
+    resp = container.get("EXPAR7")?.toString()?.trim()
+  
+    logger.debug("CONO=" + cono + ", DIVI=" + divi + ", FACI=" + faci + ",SCHN=" + schn)
+    logger.debug("WHLO=" + whlo + ", PRNO=" + prno + ", MFNO=" + mfno + ",RESP=" + resp)
+  
+    return true
+  }
+  //********************************************************************************************************
+  //  Validate incoming data
+  // *******************************************************************************************************
+  boolean validateData() {
+   
+    logger.debug("Validation started")               
+    Optional<DBContainer> CMNCMP = findCMNCMP(cono)  
+    if(!CMNCMP.isPresent()){                         
+      logger.error("Company " + cono + " is invalid")   
+      exitBatch("Company " + cono + " is invalid")
+      return false                                            
+    }     
+    if (divi != null && !divi.trim().isEmpty()) {
+       Optional<DBContainer> CMNDIV = findCMNDIV(divi)  
+      if(!CMNDIV.isPresent()){                         
+         logger.error("division " + divi + " is invalid") 
+         exitBatch("division " + divi + " is invalid")
+         return false                                           
+      }     
+    }
+    if (faci != null && !faci.trim().isEmpty()) {
+       Optional<DBContainer> CFACIL = findCFACIL(divi, faci)  
+      if(!CFACIL.isPresent()){                         
+         logger.error("Facility " + faci + " does not exist in division " + divi) 
+         exitBatch("Facility " + faci + " does not exist in division " + divi) 
+         return false                                           
+      }     
+    }
+    if (whlo != null && !whlo.trim().isEmpty()) {
+      Optional<DBContainer> MITWHL = findMITWHL(cono, whlo)  
+      if(!MITWHL.isPresent()){                         
+        logger.error("Warehouse " + whlo + " is invalid")   
+        exitBatch("Warehouse " + whlo + " is invalid")   
+         return false                                           
+      }   
+    }
+    if (prno != null && !prno.trim().isEmpty()) {
+      Optional<DBContainer> MITMAS = findMITMAS(prno)  
+      if(!MITMAS.isPresent()){                         
+        logger.error("Product " + prno + " is invalid") 
+        exitBatch("Product " + prno + " is invalid")
+         return  false                                         
+      }   
+    }
+    if (mfno != null && !mfno.trim().isEmpty()) {
+      Optional<DBContainer> MWOHED = findMWOHED(faci, prno, mfno)  
+      if(!MWOHED.isPresent()){                         
+        logger.error("Manufacturing Order " + mfno + " is invalid")   
+        exitBatch("Manufacturing Order " + mfno + " is invalid")
+         return false                                          
+      }   
+    }
+    if (resp != null && !resp.trim().isEmpty()) {
+      Optional<DBContainer> CMNUSR = findCMNUSR(divi, resp)  
+      if(!CMNUSR.isPresent()){                         
+         logger.error("Responsible " + resp + " is invalid")  
+         exitBatch("Responsible " + resp + " is invalid") 
+         return false                                         
+      }   
+    }
+    return true
+  }
+  //********************************************************************************************************
+  //Validate company
+  //******************************************************************************************************** 
+  private Optional<DBContainer> findCMNCMP(int CONO){                             
+    DBAction query = database.table("CMNCMP").index("00").selection("JICONO").build()   
+    DBContainer CMNCMP = query.getContainer()                                           
+    CMNCMP.set("JICONO", CONO)   
+    if(query.read(CMNCMP))  {                                                           
+      return Optional.of(CMNCMP)                                                        
+    }                                                                                   
+    return Optional.empty()                                                             
+  } 
+  //********************************************************************************************************
+  //Validate Division
+  //******************************************************************************************************** 
+  private Optional<DBContainer> findCMNDIV(String DIVI){                             
+    DBAction query = database.table("CMNDIV").index("00").selection("CCCONO", "CCDIVI").build()   
+    DBContainer CMNDIV = query.getContainer()                                           
+    CMNDIV.set("CCCONO", cono)   
+    CMNDIV.set("CCDIVI", divi) 
+    if(query.read(CMNDIV))  {                                                           
+      return Optional.of(CMNDIV)                                                        
+    }                                                                                   
+    return Optional.empty()                                                             
+  } 
+  //********************************************************************************************************
+  //Validate Facility
+  //******************************************************************************************************** 
+  private Optional<DBContainer> findCFACIL(String DIVI, String FACI){                             
+    DBAction query = database.table("CFACIL").index("10").selection("CFCONO", "CFDIVI", "CFFACI").build()   
+    DBContainer CFACIL = query.getContainer()   
+    CFACIL.set("CFCONO", cono) 
+    CFACIL.set("CFDIVI", DIVI)   
+    CFACIL.set("CFFACI", FACI)  
+    if(query.read(CFACIL))  {                                                           
+      return Optional.of(CFACIL)                                                        
+    }                                                                                   
+    return Optional.empty()                                                             
+  } 
+  //********************************************************************************************************
+  //Validate Warehouse
+  //******************************************************************************************************** 
+  private Optional<DBContainer> findMITWHL(int CONO, String WHLO){                             
+    DBAction query = database.table("MITWHL").index("00").selection("MWCONO", "MWWHLO").build()   
+    DBContainer MITWHL = query.getContainer()                                           
+    MITWHL.set("MWCONO", CONO)   
+    MITWHL.set("MWWHLO", WHLO)  
+    if(query.read(MITWHL))  {                                                           
+      return Optional.of(MITWHL)                                                        
+    }                                                                                   
+    return Optional.empty()                                                             
+  } 
+  //********************************************************************************************************
+  //Validate Item Number
+  //******************************************************************************************************** 
+  private Optional<DBContainer> findMITMAS(String ITNO){                             
+    DBAction query = database.table("MITMAS").index("00").selection("MMCONO", "MMITNO").build()   
+    DBContainer MITMAS = query.getContainer()                                           
+    MITMAS.set("MMCONO", cono)   
+    MITMAS.set("MMITNO", ITNO)  
+    if(query.read(MITMAS))  {                                                           
+      return Optional.of(MITMAS)                                                        
+    }                                                                                   
+    return Optional.empty()                                                             
+  } 
+  //********************************************************************************************************
+  //Validate Manufacturing Order
+  //******************************************************************************************************** 
+  private Optional<DBContainer> findMWOHED(String FACI, String PRNO, String MFNO){                             
+    DBAction query = database.table("MWOHED").index("00").selection("VHCONO", "VHFACI", "VHPRNO", "VHMFNO").build()   
+    DBContainer MWOHED = query.getContainer()   
+    MWOHED.set("VHCONO", cono) 
+    MWOHED.set("VHFACI", FACI)   
+    MWOHED.set("VHPRNO", PRNO)  
+    MWOHED.set("VHMFNO", MFNO)  
+    if(query.read(MWOHED))  {                                                           
+      return Optional.of(MWOHED)                                                        
+    }                                                                                   
+    return Optional.empty()                                                             
+  } 
+  //********************************************************************************************************
+  //Validate Responsible
+  //******************************************************************************************************** 
+  private Optional<DBContainer> findCMNUSR(String DIVI, String USID){                             
+    DBAction query = database.table("CMNUSR").index("00").selection("JUCONO", "JUDIVI", "JUUSID").build()   
+    DBContainer CMNUSR = query.getContainer() 
+    CMNUSR.set("JUCONO", 0)  
+    CMNUSR.set("JUDIVI", "")   
+    CMNUSR.set("JUUSID", USID)  
+    if(query.read(CMNUSR))  {                                                           
+      return Optional.of(CMNUSR)                                                        
+    }                                                                                   
+    return Optional.empty()                                                             
+  } 
+  //********************************************************************************************************
+  // Get Supply chain Number
+  //********************************************************************************************************
+  private String getSupplyChainNo(int cono, String whlo, String prno, String mfno) {
+
+    String result = null
+  
+    DBAction action = database.table("MPREAL")
+      .index("60")
+      .selection("NASCNB")
+      .build()
+  
+    DBContainer container = action.getContainer()
+    container.set("NACONO", cono)
+    container.set("NAWHLO", whlo)
+    container.set("NAITNO", prno)
+    container.set("NAAOCA", "101")
+    container.set("NAARDN", mfno)
+  
+    action.readAll(container, 5, 1, { DBContainer data ->
+      result = data.get("NASCNB").toString()
+    })
+  
+    return result
+  }
+  //********************************************************************************************************
+  // Find all MO numbers for scnb
+  //********************************************************************************************************
+  private List<Map<String, String>> getAllMOs(String scnb) {
+
+    List<Map<String, String>> list = new ArrayList<Map<String, String>>()
+
+    DBAction action = database.table("MPREAL")
+      .index("70")
+      .selection("NACONO", "NAITNO", "NAARDN")
+      .build()
+
+    DBContainer container = action.getContainer()
+    container.set("NACONO", cono)
+    container.set("NASCNB", scnb)
+    container.set("NAAOCA", "101")
+
+    action.readAll(container, 3, { DBContainer rec ->
+
+      Map<String, String> map = new HashMap<String, String>()
+      map.put("NACONO", rec.get("NACONO").toString())
+      map.put("NAITNO", rec.get("NAITNO").toString())
+      map.put("NAARDN", rec.get("NAARDN").toString())
+
+      list.add(map)
+    })
+
+    return list
+  }
+  //********************************************************************************************************
+  // Update all MO numbers with scnb
+  //********************************************************************************************************
+  private void updateMWOHED(int cono, String faci, String prno, String mfno, long schn) {
+
+    DBAction action = database.table("MWOHED").index("00").build()
+    DBContainer container = action.getContainer()
+
+    container.set("VHCONO", cono)
+    container.set("VHFACI", faci)
+    container.set("VHPRNO", prno)
+    container.set("VHMFNO", mfno)
+
+    action.readLock(container, updateMWOHEDCallBack()) 
+  }
+  private Closure<LockedResult> updateMWOHEDCallBack() {
+
+    return { LockedResult lockedResult ->
+  
+      LocalDateTime now = LocalDateTime.now()
+      DateTimeFormatter format1 = DateTimeFormatter.ofPattern("yyyyMMdd")
+      String formatDate = now.format(format1)
+  
+      int changeNo = lockedResult.get("VHCHNO")
+      int newChangeNo = changeNo + 1
+  
+      lockedResult.set("VHSCHN", schn)
+  
+      int changeddate = Integer.parseInt(formatDate)
+      lockedResult.set("VHLMDT", changeddate)
+  
+      lockedResult.set("VHCHNO", newChangeNo)
+      lockedResult.set("VHCHID", program.getUser())
+  
+      lockedResult.update()
+      return null   
+    }
+  }
+  //********************************************************************************************************
+  // Update all operations linked to MO numbers with scnb
+  //********************************************************************************************************
+  private void updateMWOOPE(int cono, String faci, String prno, String mfno, long schn) {
+
+    DBAction action = database.table("MWOOPE").index("00").build()
+    DBContainer container = action.getContainer()
+
+    container.set("VOCONO", cono)
+    container.set("VOFACI", faci)
+    container.set("VOPRNO", prno)
+    container.set("VOMFNO", mfno)
+    
+    action.readAll(container, 4, { DBContainer rec ->
+    
+      DBContainer lock = action.getContainer()
+      lock.set("VOCONO", rec.get("VOCONO"))
+      lock.set("VOFACI", rec.get("VOFACI"))
+      lock.set("VOPRNO", rec.get("VOPRNO"))
+      lock.set("VOMFNO", rec.get("VOMFNO"))
+      lock.set("VOOPNO", rec.get("VOOPNO"))
+
+      action.readLock(lock, updateMWOOPECallBack()) 
+    })
+  }
+  private Closure<LockedResult> updateMWOOPECallBack() {
+
+    return { LockedResult lockedResult ->
+  
+      LocalDateTime now = LocalDateTime.now()
+      DateTimeFormatter format1 = DateTimeFormatter.ofPattern("yyyyMMdd")
+      String formatDate = now.format(format1)
+  
+      int changeNo = lockedResult.get("VOCHNO")
+      int newChangeNo = changeNo + 1
+  
+      lockedResult.set("VOSCHN", schn)
+  
+      int changeddate = Integer.parseInt(formatDate)
+      lockedResult.set("VOLMDT", changeddate)
+  
+      lockedResult.set("VOCHNO", newChangeNo)
+      lockedResult.set("VOCHID", program.getUser())
+  
+      lockedResult.update()
+      return null   
+    }
+  }
+  //********************************************************************************************************
+  // Update all materials linked to MO numbers with scnb
+  //********************************************************************************************************
+  private void updateMWOMAT(int cono, String faci, String prno, String mfno, long schn) {
+
+    DBAction action = database.table("MWOMAT").index("00").build()
+    DBContainer container = action.getContainer()
+
+    container.set("VMCONO", cono)
+    container.set("VMFACI", faci)
+    container.set("VMPRNO", prno)
+    container.set("VMMFNO", mfno)
+  
+    action.readAll(container, 4, { DBContainer rec ->
+      DBContainer lock = action.getContainer()
+      lock.set("VMCONO", rec.get("VMCONO"))
+      lock.set("VMFACI", rec.get("VMFACI"))
+      lock.set("VMPRNO", rec.get("VMPRNO"))
+      lock.set("VMMFNO", rec.get("VMMFNO"))
+      lock.set("VMMSEQ", rec.get("VMMSEQ"))
+      action.readLock(lock, updateMWOMATCallBack()) 
+    })
+  }
+  private Closure<LockedResult> updateMWOMATCallBack() {
+
+    return { LockedResult lockedResult ->
+  
+      LocalDateTime now = LocalDateTime.now()
+      DateTimeFormatter format1 = DateTimeFormatter.ofPattern("yyyyMMdd")
+      String formatDate = now.format(format1)
+  
+      int changeNo = lockedResult.get("VMCHNO")
+      int newChangeNo = changeNo + 1
+  
+      lockedResult.set("VMSCHN", schn)
+  
+      int changeddate = Integer.parseInt(formatDate)
+      lockedResult.set("VMLMDT", changeddate)
+  
+      lockedResult.set("VMCHNO", newChangeNo)
+      lockedResult.set("VMCHID", program.getUser())
+  
+      lockedResult.update()
+      return null   
+    }
+  }
+  private Map<String, String> mapOf(String k1, String v1) {
+    Map<String, String> map = new HashMap<String, String>()
+    map.put(k1, v1)
+    return map
+  }
+  private void updateEXTPARStatus(String status, String message) {
+    DBAction action = database.table("EXTPAR").index("00").build()
+    DBContainer container = action.getContainer()
+  
+    container.set("EXCONO", cono)
+    container.set("EXBJNO", uuid)
+    container.set("EXBJLI", "00")
+    container.set("EXBJNA", "EXT537")
+  
+    action.readLock(container, { LockedResult lr ->
+  
+      LocalDateTime now = LocalDateTime.now()
+      int lmdt = Integer.parseInt(now.format(DateTimeFormatter.ofPattern("yyyyMMdd")))
+  
+      int chno = lr.get("EXCHNO")
+      lr.set("EXCHNO", chno + 1)
+  
+      lr.set("EXSTAT", status)
+  
+      // truncate message to safe length (e.g. 100 chars)
+      if (message != null && message.length() > 100) {
+        message = message.substring(0, 100)
+      }
+      lr.set("EXERMS", message ?: "")
+  
+      lr.set("EXLMDT", lmdt)
+      lr.set("EXCHID", program.getUser())
+  
+      lr.update()
+    })
+  }
+  private Map<String, String> mapOf(String k1, String v1, String k2, String v2) {
+    Map<String, String> map = new HashMap<String, String>()
+    map.put(k1, v1)
+    map.put(k2, v2)
+    return map
+  }
+  private void exitBatch(String message) {
+    logger.error(message)
+    updateEXTPARStatus("90", message)
+    deleteLock()
+    return
+  }
+}
